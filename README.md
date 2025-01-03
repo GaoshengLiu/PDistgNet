@@ -1,6 +1,7 @@
 # Efficient Light Field Image Super-Resolution via Progressive Disentangling
 
 This repository contains official pytorch implementation of Efficient Light Field Image Super-Resolution via Progressive Disentangling, accepted by NTIRE 2024, done by Gaosheng Liu, Huanjing Yue, and Jingyu Yang.
+![Network](https://github.com/GaoshengLiu/LF-DGNet/blob/main/fig/PDistgNet.jpg)  
 
 ## Dataset
 We use the processed data by [LF-DFnet](https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=9286855), including EPFL, HCInew, HCIold, INRIA and STFgantry datasets for training and testing. Please download the dataset in the official repository of [LF-DFnet](https://github.com/YingqianWang/LF-DFnet).
