@@ -22,17 +22,16 @@ class Net(nn.Module):
         ##################### Initial Convolution #####################
         self.conv_init0 = nn.Sequential(
             nn.Conv3d(1, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), dilation=1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
         )
         self.conv_init = nn.Sequential(
               nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), dilation=1, bias=False),
               nn.LeakyReLU(0.2, inplace=True),
               nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), dilation=1, bias=False),
               nn.LeakyReLU(0.2, inplace=True),
-              nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), dilation=1, bias=False),
-              nn.LeakyReLU(0.2, inplace=True),
           )
 
-        ################ Alternate AngTrans & C42Connv ################
+        ################ Alternate AngTrans & C42Conv ################
         self.altblock = self.make_layer(layer_num=layer_num)
 
         ####################### UP Sampling ###########################
@@ -48,7 +47,7 @@ class Net(nn.Module):
         for i in range(layer_num):
             layers.append(AngFilter(self.angRes, self.channels, self.MHSA_params))
             layers.append(LWC42_Conv(self.angRes, self.channels))
-        layers.append(nn.Conv3d(self.channels, self.channels, kernel_size=(1, 3, 3), padding=(0, 1, 1), dilation=1, bias=False))
+        layers.append(nn.Conv3d(self.channels, self.channels, kernel_size=(1, 1, 1), padding=(0, 0, 0), dilation=1, bias=False))
         return nn.Sequential(*layers)
 
     def forward(self, lr):
@@ -56,10 +55,6 @@ class Net(nn.Module):
         lr_upscale = interpolate(lr, self.angRes, scale_factor=self.factor, mode='bicubic')
 
         lr = rearrange(lr, 'b c (a1 h) (a2 w) -> b c (a1 a2) h w', a1=self.angRes, a2=self.angRes)
-
-        for m in self.modules():
-            m.h = lr.size(-2)
-            m.w = lr.size(-1)
 
         # Initial Convolution
         buffer_init = self.conv_init0(lr)
@@ -80,6 +75,17 @@ class Net(nn.Module):
         out = buffer + lr_upscale
 
         return out
+    
+class ResBlock(nn.Module):
+    def __init__(self, channel):
+        super(ResBlock, self).__init__()
+        self.conv_1 = nn.Sequential(nn.Conv3d(channel,channel, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1),
+                                              dilation=(1, 1, 1), bias=False), nn.LeakyReLU(0.1, inplace=True))
+        self.conv_2 = nn.Conv3d(channel, channel, kernel_size=(1, 3, 3), stride=1, padding=(0, 1, 1), bias=False)
+
+    def forward(self, x):
+        out = self.conv_2(self.conv_1(x))
+        return x + out
 
 class PositionEncoding(nn.Module):
     def __init__(self, temperature):
@@ -135,20 +141,10 @@ class AngTrans(nn.Module):
             nn.Dropout(MHSA_params['dropout'])
         )
 
-    @staticmethod
-    def SAI2Token(buffer):
-        buffer_token = rearrange(buffer, 'b c a h w -> a (b h w) c')
-        return buffer_token
-
-    def Token2SAI(self, buffer_token):
-        buffer = rearrange(buffer_token, '(a) (b h w) (c) -> b c a h w', a=self.angRes ** 2, h=self.h, w=self.w)
-        return buffer
-
     def forward(self, buffer):
         b, c, a, h, w = buffer.shape
-        # attn_mask = self.gen_mask(v, w, self.mask_field[0], self.mask_field[1]).to(buffer.device)
-        ang_token = self.SAI2Token(buffer)
-        ang_PE = self.SAI2Token(self.ang_position)
+        ang_token = rearrange(buffer, 'b c a h w -> a (b h w) c')
+        ang_PE = rearrange(self.ang_position, 'b c a h w -> a (b h w) c')
         ang_token_norm = self.norm(ang_token + ang_PE)
         ang_token = self.attention(query=ang_token_norm,
                                    key=ang_token_norm,
@@ -156,62 +152,7 @@ class AngTrans(nn.Module):
                                    need_weights=False)[0] + ang_token
 
         ang_token = self.feed_forward(ang_token) + ang_token
-        buffer = self.Token2SAI(ang_token)
-
-        return buffer
-class EpiTrans(nn.Module):
-    def __init__(self, channels, spa_dim, num_heads=8, dropout=0.):
-        super(EpiTrans, self).__init__()
-        self.linear_in = nn.Linear(channels, spa_dim, bias=False)
-        self.norm = nn.LayerNorm(spa_dim)
-        self.attention = nn.MultiheadAttention(spa_dim, num_heads, dropout, bias=False)
-        nn.init.kaiming_uniform_(self.attention.in_proj_weight, a=math.sqrt(5))
-        self.attention.out_proj.bias = None
-        self.attention.in_proj_bias = None
-        self.feed_forward = nn.Sequential(
-            nn.LayerNorm(spa_dim),
-            nn.Linear(spa_dim, spa_dim*2, bias=False),
-            nn.ReLU(True),
-            nn.Dropout(dropout),
-            nn.Linear(spa_dim*2, spa_dim, bias=False),
-            nn.Dropout(dropout)
-        )
-        self.linear_out = nn.Linear(spa_dim, channels, bias=False)
-
-    def gen_mask(self, h: int, w: int, k_h: int, k_w: int):
-        attn_mask = torch.zeros([h, w, h, w])
-        k_h_left = k_h // 2
-        k_h_right = k_h - k_h_left
-        k_w_left = k_w // 2
-        k_w_right = k_w - k_w_left
-        for i in range(h):
-            for j in range(w):
-                temp = torch.zeros(h, w)
-                temp[max(0, i - k_h_left):min(h, i + k_h_right), max(0, j - k_w_left):min(w, j + k_w_right)] = 1
-                attn_mask[i, j, :, :] = temp
-
-        attn_mask = rearrange(attn_mask, 'a b c d -> (a b) (c d)')
-        attn_mask = attn_mask.float().masked_fill(attn_mask == 0, float('-inf')).masked_fill(attn_mask == 1, float(0.0))
-
-        return attn_mask
-
-    def forward(self, buffer):
-        [_, _, n, v, w] = buffer.size()
-        # attn_mask = self.gen_mask(v, w, self.mask_field[0], self.mask_field[1]).to(buffer.device)
-
-        epi_token = rearrange(buffer, 'b c n v w -> (v w) (b n) c')
-        epi_token = self.linear_in(epi_token)
-
-        epi_token_norm = self.norm(epi_token)
-        epi_token = self.attention(query=epi_token_norm,
-                                   key=epi_token_norm,
-                                   value=epi_token,
-                                #    attn_mask=attn_mask,
-                                   need_weights=False)[0] + epi_token
-
-        epi_token = self.feed_forward(epi_token) + epi_token
-        epi_token = self.linear_out(epi_token)
-        buffer = rearrange(epi_token, '(v w) (b n) c -> b c n v w', v=v, w=w, n=n)
+        buffer = rearrange(ang_token, '(a) (b h w) (c) -> b c a h w', a=a, h=h, w=w)
 
         return buffer
 
@@ -231,7 +172,6 @@ class AngFilter(nn.Module):
         buffer = self.conv(self.ang_trans(x)) + shortcut
         return buffer
 
-
 class LWC42_Conv(nn.Module):
     def __init__(self, angRes, ch):
         super(LWC42_Conv, self).__init__()                
@@ -245,10 +185,10 @@ class LWC42_Conv(nn.Module):
         self.fuse = nn.Sequential(
                 nn.Conv3d(in_channels = S_ch+A_ch+E_ch*2+D_ch*2+ch//4*3, out_channels = ch, kernel_size = 1, stride = 1, padding = 0, dilation=1),
                 nn.LeakyReLU(0.2, inplace=True),
-                nn.Conv3d(ch, ch, kernel_size = (1,3,3), stride = 1, padding = (0,1,1), groups=ch, dilation=1))
+                # nn.Conv3d(ch, ch, kernel_size = (1,3,3), stride = 1, padding = (0,1,1), dilation=1))
+                nn.Conv3d(ch, ch, kernel_size = (1,5,5), stride = 1, groups = ch, padding = (0,2,2), dilation=1))
         self.conv_0 = nn.Conv3d(in_channels = ch, out_channels = ch, kernel_size = 1, stride = 1, padding = 0, dilation=1)
         self.conv_1 = nn.Conv3d(in_channels = ch//4*3, out_channels = ch, kernel_size = 1, stride = 1, padding = 0, dilation=1)
-        # self.conv_1 = nn.Conv3d(in_channels = ch, out_channels = ch, kernel_size = (1,3,3), stride = 1, padding = (0,1,1), dilation=1)
         self.conv_2 = nn.Conv3d(in_channels = ch//4*3, out_channels = ch, kernel_size = 1, stride = 1, padding = 0, dilation=1)
         self.conv_3 = nn.Conv3d(in_channels = ch//4*3, out_channels = ch, kernel_size = 1, stride = 1, padding = 0, dilation=1)
         self.conv_4 = nn.Conv3d(in_channels = ch//4*3, out_channels = ch, kernel_size = 1, stride = 1, padding = 0, dilation=1)
@@ -281,8 +221,6 @@ class LWC42_Conv(nn.Module):
         buffer_6, buffer = ChannelSplit(buffer)
         dpiv_in = buffer_6.contiguous().view(b, c//4, an, an, h, w).permute(0,1,2,3,5,4) # b,c,u,v,w,h
         dpiv_out = self.dpiconv(dpiv_in).reshape(b, -1, an, an, w, h).permute(0,1,2,3,5,4).reshape(b, -1, n, h, w)
-        # s_out = self.spaconv(buffer)
-        # buffer = self.lrelu(self.conv_1(buffer))
 
         out = torch.cat((s_out, a_out, epih_out, epiv_out, dpih_out, dpiv_out, buffer), 1)
         out = self.fuse(out)
@@ -361,15 +299,11 @@ if __name__ == "__main__":
     # from thop import profile
     from fvcore.nn import FlopCountAnalysis, parameter_count_table
     input = (torch.randn(1, 1, 160, 160),)#.cuda()
+    # 
+    # flops, params = profile(net, inputs=(input,))
+    # 
+    # print('   Number of FLOPs: %.2fG' % (flops / 1e9))    
     flops = FlopCountAnalysis(net, input)
     print("FLOPs: ", flops.total())
     total = sum([param.nelement() for param in net.parameters()])
     print('   Number of parameters: %.2fM' % (total / 1e6))
-# if __name__ == "__main__":
-#     net = Net(5, 4)#.cuda()
-#     from thop import profile
-#     input = torch.randn(1, 1, 160, 160)#.cuda()
-#     total = sum([param.nelement() for param in net.parameters()])
-#     flops, params = profile(net, inputs=(input,))
-#     print('   Number of parameters: %.2fM' % (total / 1e6))
-#     print('   Number of FLOPs: %.2fG' % (flops / 1e9))
