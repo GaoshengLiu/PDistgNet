@@ -24,7 +24,7 @@ If you find this work helpful, please consider citing the following papers:<br>
 @inproceedings{liu2024efficient,
   title={Efficient Light Field Image Super-Resolution via Progressive Disentangling},
   author={Liu, Gaosheng and Yue, Huanjing and Yang, Jingyu},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition Workshops},
   pages={6277--6286},
   year={2024}
 }
